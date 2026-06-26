@@ -1,0 +1,1524 @@
+---
+title: "More Timely Payment of Property Taxes Through Simplification"
+author: "Sloboda - Pavlovský - Sičáková-Beblavá - Szabo"
+date: "2025-07-01"
+output: html_document
+---
+
+```{r setup, echo=FALSE}
+knitr::opts_chunk$set(eval = TRUE, 
+                      echo = FALSE, 
+                      message=FALSE, 
+                      warning = FALSE, 
+                      kable.caption = NA, 
+                      results = "asis")
+
+knitr::opts_knit$set(root.dir = "~/Library/Mobile Documents/com~apple~CloudDocs/Documents/ÚVP - veda, prednášky/veda_Administrative burden/Property tax paper/Submit_EaG")
+```
+
+## Read Me
+
+This file replicates the analysis of the following paper: "*More Timely Payment of Property Taxes Through Simplification*". The file replicates the results shown in the main text as well as in the Supplementary Materials.
+
+```{r, message=FALSE}
+rm(list = ls())
+
+# Required Libraries 
+library(rio)
+library(tidyverse)
+library(gridExtra)
+library(estimatr) # lm_robust 
+library(margins)
+library(modelsummary) # modelsummary
+library(kableExtra)
+library(sjPlot)
+library(car)
+library(marginaleffects)
+
+# Importing Dataset
+raw_data <- import("tax_compliance.csv")
+
+# Renaming variable names from Slovak to English 
+data <- raw_data %>% 
+  dplyr::rename(
+    ID = REFERENCNECISLO, 
+    Gender = POHLAVIE, 
+    Age = VEK,
+    Tax_total = DANCELKOM,
+    Tax_paid = UHRADENACIASTKA, 
+    Tax_paid_before_duedate = UHRADENACIASTKADOSPLATNOSTI,
+    Tax_paid_after_duedate = UHRADENACIASTKAPOSPLATNOSTI, 
+    Tax_outstanding = ZOSTAVAUHRADIT, 
+    Treatment = INTERVENCIA,
+    Tax_declaration_21 = PRIZNANIE2021A,
+    Admin_ID = CISLOSPRAVKYNE
+    ) 
+
+# Recoding Gender Variable 
+data <- data %>% 
+  mutate(Gender = case_match(Gender, 
+    "zena" ~ "F", 
+    "muz" ~ "M"
+  )) %>% 
+  mutate(sex = if_else(Gender == "M", 0, 1)) %>% 
+  relocate(sex, .after = Gender)
+
+data$Gender <- factor(data$Gender, levels = c("M", "F"))
+
+# Recoding Treatment Variable 
+data <- data %>%  
+ mutate(Treatment = case_match(Treatment,
+                                "Export DZN A" ~ "A",
+                                "Export DZN B" ~ "B",
+                                "Export DZN C" ~ "C",
+                                "Export DZN D" ~ "D",
+                                "Export DZN E" ~ "E")) %>% 
+  mutate(Treatment_full = case_match(Treatment,
+                                "A" ~ "Control",
+                                "B" ~ "Simplification",
+                                "C" ~ "Simplification + Social Norm",
+                                "D" ~ "Simplification + Deterrence",
+                                "E" ~ "Simplification + Public Good Appeal")) %>% 
+  relocate(Treatment_full, .after = Treatment)
+
+
+data$Treatment_full <- factor(data$Treatment_full, levels = c("Control", "Simplification", "Simplification + Social Norm", "Simplification + Deterrence", "Simplification + Public Good Appeal"))
+
+# Setting as Factor 
+data <- data %>% 
+  mutate(Admin_ID = as.factor(Admin_ID)) %>% 
+  mutate(Tax_declaration_21 = as.factor(Tax_declaration_21)) 
+
+# Creating the Outcome Variable(s) Tax_paid_singlepay & Tax_paid_install 
+data <- data %>% 
+  mutate(Residul_tax_before_duedate = Tax_total - Tax_paid_before_duedate) %>% 
+  mutate(Tax_paid_singlepay = if_else(Residul_tax_before_duedate == 0, 1, 0)) %>% 
+   mutate(Tax_paid_late = if_else(Tax_paid_after_duedate == 0, 0, 1)) %>% 
+   mutate(Tax_paid_install = if_else(Tax_paid_before_duedate == 0, 0, 1))
+```
+
+```{r}
+# Materials and procedures - Number of Obs. per Each Treatment for Table 1 
+obs_per_treatment <- data %>% 
+  group_by(Treatment_full) %>% 
+  summarise(n = n())
+
+# print(obs_per_treatment)
+```
+
+```{r}
+## Number of Taxpayers per Administrator and Treatment
+admin_check <- data %>% 
+  group_by(Admin_ID, Treatment) %>% 
+  dplyr::summarise(n = n()) %>% 
+  pivot_wider(names_from = Treatment, values_from = n) %>% 
+  mutate(across(where(is.integer), ~replace_na(., 0))) %>% 
+  relocate(A, .before = B) %>% 
+  relocate(D, .before = E)
+```
+
+```{r}
+# Filtering wrongly assigned treatments (more than one treatment per administrator) 
+admin_dominant <- data %>%
+  dplyr::count(Admin_ID, Treatment) %>%
+  group_by(Admin_ID) %>%
+  slice_max(n, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  dplyr::select(Admin_ID, Treatment)
+
+data_subset <- data %>%
+  inner_join(admin_dominant, by = c("Admin_ID", "Treatment"))
+
+# nrow(data) - nrow(data_subset)  
+
+# n_admin <- data_subset %>% 
+#  group_by(Admin_ID) %>% 
+#  summarise(n = n()) 
+
+# range(n_admin$n)
+
+# data_subset %>% 
+#  group_by(Treatment) %>% 
+#  summarise(Count = n_distinct(Admin_ID))
+```
+
+```{r}
+# Descriptive Statistics of the Selected Variable per Each Treatment
+treatment_randomization_check <- data_subset %>% 
+  group_by(Treatment) %>% 
+  dplyr::summarise(
+    `Mean tax total` = round(mean(Tax_total), 2), 
+    `Mean tax paid` = round(mean(Tax_paid), 2), 
+    `Mean tax outstanding` = round(mean(Tax_outstanding), 2), 
+    `Share of people filling tax declaration in 2021 (%)` = round(mean(Tax_declaration_21 == "1", na.rm = TRUE) * 100, 2), 
+    `Share of female (%)` = round(mean(sex)*100, 2),
+    `Mean age` = round(mean(Age), 2)) %>% 
+   pivot_longer(
+    cols = -Treatment,
+    names_to = "Statistics",
+    values_to = "Value"
+  ) %>% 
+  pivot_wider(
+    names_from = Treatment,
+    values_from = Value
+  )
+
+print(treatment_randomization_check)
+```
+
+```{r}
+# Treatment Randomization Check - Total Tax Burden
+# anova1 <- aov(Tax_total ~ Treatment, data = data_subset)
+# summary(anova1)
+# anova1.residuals <- residuals( object = anova1 )   
+# qqnorm(anova1.residuals)
+# nortest::ad.test(anova1.residuals)
+
+anova_tax <- kruskal.test(Tax_total ~ Treatment, data = data_subset)
+
+anova_tax_df <- data.frame(
+  Statistic = anova_tax$statistic,
+  `p value` = anova_tax$p.value,
+  df = anova_tax$parameter
+)
+
+pairwise_wilcox <- pairwise.wilcox.test(
+  data_subset$Tax_total, 
+  data_subset$Treatment,
+  p.adjust.method = "bonferroni"
+)
+
+pairwise_wilcox_df <- as.data.frame(pairwise_wilcox$p.value)%>% 
+   mutate(across(where(is.numeric), ~ round(., 3)))
+
+pairwise_wilcox_df <- pairwise_wilcox_df %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.), "-", format(round(., 2), nsmall = 2)))) %>%
+  mutate(across(everything(), ~ ifelse(. == "1.00", "1.00", .)))
+
+print(anova_tax_df)
+print(pairwise_wilcox_df)
+
+## Table B.1d: Treatment Randomization Check - Gender 
+# chisq_gender <- CrossTable(data_subset$Gender, data_subset$Treatment, 
+#            prop.r = FALSE,
+#            prop.c = FALSE,
+#            prop.t = FALSE,
+#            prop.chisq = FALSE,
+#            chisq = TRUE)
+
+Gender_Treatment <- table(data_subset$Gender, data_subset$Treatment)
+chisq_df <- chisq.test(Gender_Treatment)
+
+chisq_gender_df <- data.frame(
+  Statistic = chisq_df$statistic,
+  `p value` = chisq_df$p.value,
+  df = chisq_df$parameter
+)
+
+print(chisq_gender_df)
+
+## Table B.1e: Treatment Randomization Check - Age
+# anova2 <- aov(Age ~ Treatment, data = data_subset)
+# summary(anova2)
+# anova2.residuals <- residuals(object = anova2)   
+# qqnorm(anova2.residuals)
+# nortest::ad.test(anova2.residuals)
+
+anova_age <- kruskal.test(Age ~ Treatment, data = data_subset)
+
+anova_age_df <- data.frame(
+  Statistic = anova_age$statistic,
+  `p value` = anova_age$p.value,
+  df = anova_age$parameter
+)
+
+pairwise_wilcox_age <- pairwise.wilcox.test(
+  data_subset$Age, 
+  data_subset$Treatment,
+  p.adjust.method = "bonferroni"
+)
+
+pairwise_wilcox_age_df <- as.data.frame(pairwise_wilcox_age$p.value)%>% 
+   mutate(across(where(is.numeric), ~ round(., 3)))
+
+pairwise_wilcox_age_df <- pairwise_wilcox_age_df %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.), "-", format(round(., 2), nsmall = 2)))) %>%
+  mutate(across(everything(), ~ ifelse(. == "1.00", "1.00", .)))
+
+print(anova_age_df)
+print(pairwise_wilcox_age_df)
+
+## Treatment Randomization Check - Tax Declaration 
+Tax_declaration_Treatment <- table(data_subset$Tax_declaration_21, data_subset$Treatment)
+chisq_df <- chisq.test(Tax_declaration_Treatment)
+
+chisq_Tax_declaration_df <- data.frame(
+  Statistic = chisq_df$statistic,
+  `p value` = chisq_df$p.value,
+  df = chisq_df$parameter
+)
+
+print(chisq_Tax_declaration_df)
+```
+
+```{r}
+## Share of Taxpayers by Age Decil 
+age_mean <- mean(data_subset$Age)
+
+plot_age <- ggplot(data = data_subset, aes(x = Age)) + 
+  geom_histogram(fill = "grey", colour = "black", bins = 10)+
+  stat_function(fun = function(x) dnorm(x, mean = mean(data$Age), sd = sd(data$Age)),
+                color = "black", linetype = "dotted") + 
+  geom_vline(xintercept = age_mean, linetype = "dashed", color = "black")+
+  theme(
+    text = element_text(face = "plain")  
+  ) +
+  theme_classic() +
+  labs(y = "No. of observations", x = "Age") 
+
+print(plot_age)
+```
+
+```{r}
+# Filtering out age outliers 
+data_subset <- data_subset %>% 
+  mutate(Age_outlier = if_else(Age < 18 | Age > 100, 1, 0)) 
+
+# data_subset %>% 
+#  group_by(Age_outlier) %>% 
+#  summarise(n = n())
+
+data_subset <- data_subset %>%
+  filter(Age_outlier != 1)
+```
+
+```{r}
+## Distribution of the Tax-Related Variables  
+
+plot_Tax_total <- ggplot(data = data_subset, aes(x = Tax_total)) + 
+  geom_density(fill = "grey")+
+  theme_classic()+
+  labs(y = "",
+       x = "Total tax")
+
+plot_Tax_total_paid <- ggplot(data = data_subset, aes(x = Tax_paid)) + 
+  geom_density(fill = "grey")+
+  theme_classic()+
+  labs(y = "",
+       x = "Total tax paid")
+
+plot_Tax_paid_before_duedate  <- ggplot(data = data_subset, aes(x = Tax_paid_before_duedate)) + 
+  geom_density(fill = "grey")+
+  theme_classic()+
+  labs(y = "",
+       x = "Tax paid before the due date")
+  
+plot_Tax_paid_after_duedate  <- ggplot(data = data_subset, aes(x = Tax_paid_after_duedate)) + 
+  geom_density(fill = "grey")+
+  theme_classic()+
+  labs(y = "",
+       x = "Tax paid after the due date")
+
+plot_Tax_outstanding  <- ggplot(data = data_subset, aes(x = Tax_outstanding)) + 
+  geom_density(fill = "grey")+
+  theme_classic()+
+  labs(y = "",
+       x = "Outstanding tax")
+
+grid.arrange(plot_Tax_total,plot_Tax_total_paid,  plot_Tax_paid_before_duedate, plot_Tax_paid_after_duedate, plot_Tax_outstanding)
+```
+
+```{r}
+## Descriptives Statistics per Treatment after the Cleaning Process (Table 2)
+table2 <- data_subset %>% 
+  group_by(Treatment_full) %>% 
+  summarise(N = n(),
+            `Sex (% Female)` = round(mean(sex)*100,2),
+            `Mean Age` = round(mean(Age),2),
+            `SD Age` = round(sd(Age), 2),
+            `Mean Tax` = round(mean(Tax_total),2),
+            `SD Tax` = round(sd(Tax_total), 2),
+            `Filling Tax Declaration in 2021 (%)` = round(mean(as.numeric(Tax_declaration_21))*100 - 100, 2))
+
+print(table2)
+```
+
+```{r}
+## Descriptives Statistics after the Cleaning Process (Appendix B.3)
+## Descriptive Statistics of the Numeric Variables (Ungrouped by Treatment) 
+desc_stat <- data_subset %>% 
+  select(sex, Age, Tax_total, Tax_paid, Tax_paid_before_duedate,
+         Tax_paid_after_duedate, Tax_outstanding, Residual_tax_before_duedate,
+         Tax_paid_singlepay, Tax_paid_late, Tax_paid_ontime) %>% 
+  psych::describe() %>% 
+  select(-c(vars, n, trimmed, mad))
+
+rownames(desc_stat) <- c(
+  "Gender (Female = 1)", "Age", "Tax total", "Tax paid",
+  "Tax paid before duedate", "Tax paid after duedate", "Tax outstanding",
+  "Tax residual before duedate", "Tax paid in a single payment",
+  "Tax paid late", "Tax paid in a single payment / installments")
+print(desc_stat)
+```
+
+```{r}
+## Distribution of Total Tax Burden Across the Control and Treatment Groups
+tax_dist_treat <- data_subset %>%
+  ggplot(aes(x = Treatment_full, y = Tax_total, fill = Treatment_full)) +
+  geom_violin(alpha = .3, colour = NA) +                       
+  geom_boxplot(width = .15, outlier.shape = NA) +              
+  stat_summary(geom = "point", fun = "mean", shape = 4, size = 2) +
+  scale_y_log10() +                                            
+  theme_classic() +
+  labs(y = "Tax total (EUR, log scale)", x = "Treatment") +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 30, hjust = 1, size = 8)) +
+  scale_fill_grey()
+```
+
+## Analysis
+### Average Treatment Effects (DV = Tax paid in a Single Payment or Installments)
+```{r}
+model1 <- lm_robust(Tax_paid_ontime ~ Treatment_full, 
+                    data = data_subset, clusters = Admin_ID, se_type = "CR2")
+
+model2 <- lm_robust(Tax_paid_ontime ~ Treatment_full + Tax_total + Tax_declaration_21 + Gender + Age + I(Age^2), data = data_subset, clusters = Admin_ID, se_type = "CR2")
+
+model3 <- lm_robust(Tax_paid_ontime ~ Treatment_full + Tax_total + Tax_declaration_21 + Gender + Age, data = data_subset, clusters = Admin_ID, se_type = "CR2")
+
+model_summary1 <- tidy(model1, conf.int = TRUE)
+model_summary1$model <- "Model1"
+
+model_summary2 <- tidy(model2, conf.int = TRUE)
+model_summary2$model <- "Model2"
+
+model_summary3 <- tidy(model3, conf.int = TRUE)
+model_summary3$model <- "Model3"
+
+model_all <- rbind(model_summary1, model_summary3, model_summary2) 
+
+model_two <- rbind(model_summary1, model_summary3) 
+
+model_all <- model_all %>%
+  mutate(
+    Treatment = gsub("Treatment_full", "", term)
+  ) %>% 
+  relocate(Treatment, .after = term) 
+
+model_all <- model_all %>% 
+  filter(!grepl("Admin|Age|Gender|Tax", term)) %>% 
+  mutate(Treatment = if_else(Treatment == "(Intercept)", "Control", Treatment)) %>% 
+  select(-term)
+
+model_two <- model_two %>%
+  mutate(
+    Treatment = gsub("Treatment_full", "", term)
+  ) %>% 
+  relocate(Treatment, .after = term) 
+
+model_two <- model_two %>% 
+  filter(!grepl("Admin|Age|Gender|Tax", term)) %>% 
+  mutate(Treatment = if_else(Treatment == "(Intercept)", "Control", Treatment)) %>% 
+  select(-term)
+
+model_all$Treatment <- factor(model_all$Treatment, levels = 
+                                c("Simplification + Public Good Appeal",
+                                   "Simplification + Deterrence", 
+                                   "Simplification + Social Norm", 
+                                  "Simplification", 
+                                  "Control"
+                                  ))
+
+model_two$Treatment <- factor(model_two$Treatment, levels = 
+                                c("Simplification + Public Good Appeal",
+                                   "Simplification + Deterrence", 
+                                   "Simplification + Social Norm", 
+                                  "Simplification", 
+                                  "Control"
+                                  ))
+
+model_all$model <- factor(model_all$model,
+  levels = c("Model1", "Model2", "Model3"),
+  labels = c("No covariates", "Covariates + Age squared", "Covariates + Age linear"))
+
+model_two$model <- factor(model_two$model,
+  levels = c("Model1", "Model3"),
+  labels = c("No covariates", "With Covariates"))
+
+figure1 <- model_all %>% 
+  filter(!Treatment == "Control") %>% 
+  mutate(estimate = estimate*100,
+         conf.low = conf.low*100,
+         conf.high = conf.high*100) %>% 
+  ggplot(aes(y = Treatment, x = estimate, colour = model)) +
+  geom_errorbar(aes(xmin = conf.low, xmax = conf.high), width=0, position= position_dodge(width=0.5)) +
+   geom_point(aes(x = estimate, shape = model), position = position_dodge(width=0.5), size=2) +
+  scale_x_continuous(limits=c(-1, 2.5), breaks = round(seq(-1, 2.5, by = .5), 2))+
+  geom_vline(xintercept = 0, linetype = "dashed")+
+  labs(x = expression(atop("Predicted Treatment Effect (95% CI)", italic("Property Tax Timely Payment (single payment or instalments)"), 
+      )),  y = "") +
+  theme_classic() +
+  theme(axis.text.y = element_text(angle = 30, hjust = 1, size = 8)) + 
+ scale_shape_discrete(name = "Models") +
+  scale_colour_grey(name = "Models", start = 0.2, end = 0.8, aesthetics = "colour") +
+  theme(legend.position="right") 
+
+figure1_paper <- model_two %>% 
+  filter(!Treatment == "Control") %>% 
+  mutate(estimate = estimate*100,
+         conf.low = conf.low*100,
+         conf.high = conf.high*100) %>% 
+  ggplot(aes(y = Treatment, x = estimate, colour = model)) +
+  geom_errorbar(aes(xmin = conf.low, xmax = conf.high), width=0, position= position_dodge(width=0.5)) +
+   geom_point(aes(x = estimate, shape = model), position = position_dodge(width=0.5), size=2) +
+  scale_x_continuous(limits=c(-1, 2.5), breaks = round(seq(-1, 2.5, by = .5), 2))+
+  geom_vline(xintercept = 0, linetype = "dashed")+
+  labs(x = expression(atop("Predicted Treatment Effect (95% CI)", italic("Property Tax Timely Payment (single payment or instalments)"), 
+      )),  y = "") +
+  theme_classic() +
+  theme(axis.text.y = element_text(angle = 30, hjust = 1, size = 8)) + 
+ scale_shape_discrete(name = "Models") +
+  scale_colour_grey(name = "Models", start = 0.2, end = 0.8, aesthetics = "colour") +
+  theme(legend.position="right") 
+```
+
+```{r}
+## Linear Hypothesis Tests 
+lh_social_norm <- linearHypothesis(model2, "Treatment_fullSimplification + Social Norm = Treatment_fullSimplification")
+Chisq_social_norm <- round(lh_social_norm$Chisq[2], 4)
+Df_social_norm <- lh_social_norm$Res.Df[2]
+P_social_norm <- round(lh_social_norm$`Pr(>Chisq)`[2], 4)
+
+lh_deterrence <- linearHypothesis(model2, "Treatment_fullSimplification + Deterrence = Treatment_fullSimplification")
+Chisq_deterrence <- round(lh_deterrence$Chisq[2], 4)
+Df_deterrence <- lh_deterrence$Res.Df[2]
+P_deterrence <- round(lh_deterrence$`Pr(>Chisq)`[2], 4)
+
+lh_public <- linearHypothesis(model2, "Treatment_fullSimplification + Public Good Appeal = Treatment_fullSimplification")
+Chisq_public <- round(lh_public$Chisq[2], 4)
+Df_public <- lh_public$Res.Df[2]
+P_public <- round(lh_public$`Pr(>Chisq)`[2], 4)
+
+# Create a data frame with the results
+lh_results <- data.frame(
+  Treatment = c(
+    "Simplification + Social Norm",
+    "Simplification + Deterrence",
+    "Simplification + Public Good Appeal"
+  ),
+  Chisq = c(Chisq_social_norm, Chisq_deterrence, Chisq_public),
+  Df = c(Df_social_norm, Df_deterrence, Df_public),
+  p_value = c(P_social_norm, P_deterrence, P_public)
+)
+
+print(lh_results)
+```
+
+```{r}
+## Predicted Probability of Tax Compliance across the Control and Treatment Groups (95% CI)
+pred_model_1 <- avg_predictions(model1, by = "Treatment_full")
+pred_model_2 <- avg_predictions(model2, by = "Treatment_full")
+pred_model_3 <- avg_predictions(model3, by = "Treatment_full")
+
+pred_model_1$model <- "Model 1: no covariates"
+pred_model_2$model <- "Model 2: covariates + Age + Age^2"
+pred_model_3$model <- "Model 3: covariates + Age"
+
+preds_all <- bind_rows(as.data.frame(pred_model_1),
+                       as.data.frame(pred_model_3),
+                       as.data.frame(pred_model_2))
+preds_two <- bind_rows(as.data.frame(pred_model_1),
+                       as.data.frame(pred_model_3))
+
+preds_two$Treatment_full <- factor(preds_two$Treatment_full,
+  levels = c("Control", "Simplification", "Simplification + Social Norm",
+             "Simplification + Deterrence", "Simplification + Public Good Appeal"))
+
+plot_pred_prob <- ggplot(preds_two, aes(Treatment_full, estimate, colour = model)) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high),
+                width = 0, position = position_dodge(width = 0.5)) +
+  geom_point(aes(shape = model), position = position_dodge(width = 0.5), size = 2) +
+  coord_cartesian(ylim = c(.92, .95)) +    
+  ylab("Predicted Probability of Tax Compliance (95% CI)") +
+  xlab("") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1, size = 8)) +
+  scale_shape_discrete(name = "Models",
+                       labels = c("No covariates", "Covariates")) +
+  scale_colour_grey(name = "Models",
+                    labels = c("No covariates", "Covariates"),
+                    start = 0.2, end = 0.8) +
+  theme(legend.position = "right")
+```
+
+```{r Regression table, include=FALSE}
+cm <- c(
+  "Treatment_fullSimplification"                      = "Simplification",
+  "Treatment_fullSimplification + Social Norm"        = "Simplification + Social Norm",
+  "Treatment_fullSimplification + Deterrence"         = "Simplification + Deterrence",
+  "Treatment_fullSimplification + Public Good Appeal" = "Simplification + Public Good Appeal",
+  "Tax_total"           = "Tax total",
+  "Tax_declaration_211" = "Tax declaration 2021",  # term name assumes level "1"
+  "GenderF"             = "Female",
+  "Age"                 = "Age",
+  "I(Age^2)"            = "Age squared"
+)
+
+modelsummary(
+  list("Simple model" = model1, "Model with Age linear" = model3,
+       "Model with Age squared" = model2),
+  statistic = "std.error",
+  stars     = c('***' = .001, '**' = .01, '*' = .05),
+  coef_map  = cm,
+  gof_map   = c("nobs", "r.squared", "adj.r.squared"),
+  notes     = "Cluster-robust (CR2) standard errors, clustered at the administrator level (31 clusters), in parentheses."
+)
+
+```{r}
+### Heterogeneous Treatment Effects (DV = Tax paid on-time in full or in part)
+#### Heterogeneous Treatment Effects - Gender
+model_HTE_gender <- lm_robust(Tax_paid_ontime ~ Treatment_full * Gender + Tax_total + Tax_declaration_21 + Age, data = data_subset, clusters = Admin_ID, se_type = "CR2")
+
+hte_gender <- avg_comparisons(
+  model_HTE_gender,
+  variables = "Treatment_full",
+  by        = "Gender"
+) %>%
+  mutate(
+    Treatment = gsub(" - Control$", "", contrast),
+    Gender    = case_when(Gender == "F" ~ "Female",
+                          Gender == "M" ~ "Male",
+                          TRUE ~ as.character(Gender))
+  )
+
+treatment_order <- c("Simplification + Public Good Appeal",
+                     "Simplification + Deterrence",
+                     "Simplification + Social Norm",
+                     "Simplification")
+
+plot_inter_gender <- hte_gender %>%
+  mutate(estimate  = estimate  * 100,
+         conf.low  = conf.low  * 100,
+         conf.high = conf.high * 100,
+         Treatment = factor(Treatment, levels = treatment_order)) %>%
+  ggplot(aes(y = Treatment, colour = Gender)) +
+  geom_errorbar(aes(xmin = conf.low, xmax = conf.high),
+                width = 0, position = position_dodge(width = 0.5)) +
+  geom_point(aes(x = estimate, shape = Gender),
+             position = position_dodge(width = 0.5), size = 2) +
+  geom_vline(xintercept = 0, colour = "grey", linetype = "dashed") +
+  scale_x_continuous(breaks = round(seq(-1, 3, by = .5), 2)) +
+  coord_cartesian(xlim = c(-1, 3)) +
+  scale_colour_grey("Gender") +
+  scale_shape_discrete("Gender") +
+  theme_classic() +
+  theme(axis.text.y = element_text(angle = 30, hjust = 1, size = 8),
+        plot.title  = element_text(hjust = 0.5, face = "bold")) +
+  labs(
+    x = expression(atop("Predicted Treatment Effect (95% CI)",
+                        italic("Property Tax Payment (single payment or instalments)"))),
+    y = ""
+  )
+```
+
+```{r}
+hte_gender_diff <- tidy(model_HTE_gender) %>%
+  filter(grepl(":GenderF$", term)) %>%
+  select(term, estimate, std.error, statistic, df, p.value, conf.low, conf.high) %>%
+  mutate(p_holm = p.adjust(p.value, method = "holm"))
+
+lh_results <- hte_gender_diff %>%
+  mutate(Treatment = gsub("Treatment_full|:GenderF", "", term)) %>%
+  select(Treatment, estimate, std.error, statistic, df, p.value, p_holm)
+```
+
+
+```{r}
+## Figure C.1b: Predicted Probability of Tax Compliance across Treatment Groups and Gender
+plot_int_gender <- plot_model(model_HTE_gender, 
+           type = "pred",
+           terms = c("Treatment_full[all]", "Gender[all]"),
+           #colors = "bw",
+           legend.title = "Gender")+
+  theme_classic() + 
+  labs(y = "Predicted Probability of Tax Compliance (95% CI)", title = "", x = "")+ 
+  scale_colour_grey(labels = c("Male", "Female"))
+```
+
+```{r}
+## Heterogeneous Treatment Effects by Age  
+model_HTE_age <- lm_robust(Tax_paid_ontime ~ Treatment_full * Age + Treatment_full * I(Age^2) + Tax_total + Tax_declaration_21 + Gender, data = data_subset, clusters = Admin_ID, se_type = "CR2")
+
+plot1_age <- plot_model(model_HTE_age, 
+           type = "pred",
+           terms = c("Age[all]", "Treatment_full[Control, Simplification]"),
+           colors = "bw",
+           legend.title = "Treatment type")+
+  theme_classic() + 
+  labs(y = "Predicted Probability of Tax Compliance (95% CI)", title = "")+
+  theme(legend.position = "bottom")
+
+plot2_age <- plot_model(model_HTE_age, 
+           type = "pred",
+           terms = c("Age[all]", "Treatment_full[Control, Simplification + Social Norm]"),
+           colors = "bw",
+           legend.title = "Treatment type")+
+  theme_classic() + 
+  labs(y = "Predicted Probability of Tax Compliance (95% CI)", title = "")+
+  theme(legend.position = "bottom")
+
+plot3_age <- plot_model(model_HTE_age, 
+           type = "pred",
+           terms = c("Age[all]", "Treatment_full[Control, Simplification + Deterrence]"),
+           colors = "bw",
+           legend.title = "Treatment type")+
+  theme_classic() + 
+  labs(y = "Predicted Probability of Tax Compliance (95% CI)", title = "")+
+  theme(legend.position = "bottom")
+
+plot4_age <- plot_model(model_HTE_age, 
+           type = "pred",
+           terms = c("Age[all]", "Treatment_full[Control, Simplification + Public Good Appeal]"),
+           colors = "bw",
+           legend.title = "Treatment type")+
+  theme_classic() + 
+  labs(y = "Predicted Probability of Tax Compliance (95% CI)", title = "")+
+  theme(legend.position = "bottom")
+
+age_seq <- seq(min(data_subset$Age, na.rm = TRUE),
+               max(data_subset$Age, na.rm = TRUE), by = 1)
+
+hte_age <- comparisons(
+  model_HTE_age,
+  variables = "Treatment_full",
+  newdata   = datagrid(Age = age_seq)
+) %>%
+  mutate(
+    Treatment = gsub(" - Control$", "", contrast),
+    Treatment = factor(Treatment, levels = c(
+      "Simplification", "Simplification + Social Norm",
+      "Simplification + Deterrence", "Simplification + Public Good Appeal"))
+  )
+
+plot_inter_age_cont <- hte_age %>%
+  mutate(estimate  = estimate  * 100,
+         conf.low  = conf.low  * 100,
+         conf.high = conf.high * 100) %>%
+  ggplot(aes(x = Age, y = estimate)) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2, fill = "dimgrey") +
+  geom_line(size = .8, colour = "dimgrey") +
+  geom_hline(yintercept = 0, colour = "darkgrey", linetype = "dashed") +
+  facet_wrap(~ Treatment) +
+  coord_cartesian(xlim = c(20, 100)) +
+  theme_classic() +
+  labs(x = "Age",
+       y = expression(atop("Predicted Treatment Effect (95% CI)",
+                          italic("Property Tax Timely Payment (single payment or instalments)")))) +
+  theme(legend.position = "none")
+
+```
+
+```{r}
+## Figure C1c: Heterogeneous Treatment Effects by Age (linear)
+model_HTE_age_linear <- lm_robust(Tax_paid_ontime ~ Treatment_full * Age + I(Age^2) + Tax_total + Tax_declaration_21 + Gender, data = data_subset, clusters = Admin_ID, se_type = "CR2")
+
+age_seq <- seq(min(data_subset$Age, na.rm = TRUE),
+               max(data_subset$Age, na.rm = TRUE), by = 1)
+
+hte_age_linear <- comparisons(
+  model_HTE_age,
+  variables = "Treatment_full",
+  newdata   = datagrid(Age = age_seq)
+) %>%
+  mutate(
+    Treatment = gsub(" - Control$", "", contrast),
+    Treatment = factor(Treatment, levels = c(
+      "Simplification", "Simplification + Social Norm",
+      "Simplification + Deterrence", "Simplification + Public Good Appeal"))
+  )
+
+plot_inter_age_cont_linear <- hte_age_linear %>%
+  mutate(estimate  = estimate  * 100,
+         conf.low  = conf.low  * 100,
+         conf.high = conf.high * 100) %>%
+  ggplot(aes(x = Age, y = estimate)) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2, fill = "dimgrey") +
+  geom_line(size = .8, colour = "dimgrey") +
+  geom_hline(yintercept = 0, colour = "darkgrey", linetype = "dashed") +
+  facet_wrap(~ Treatment) +
+  coord_cartesian(xlim = c(20, 100)) +
+  theme_classic() +
+  labs(x = "Age",
+       y = expression(atop("Predicted Treatment Effect (95% CI)",
+                          italic("Property Tax Timely Payment (single payment or instalments)")))) +
+  theme(legend.position = "none")
+```
+
+```{r}
+## Predicted Tax Compliance by Treatment, Age and Gender  
+model_HTE_gender_age <- lm_robust(Tax_paid_ontime ~ Treatment_full * Gender * Age + Treatment_full * Gender * I(Age^2) + Tax_total + Tax_declaration_21, data = data_subset, clusters = Admin_ID, se_type = "CR2")
+
+plot_gender_age <- plot_predictions(
+  model_HTE_gender_age,
+  condition = list(
+    Age            = 20:100,
+    Gender        = unique,
+    Treatment_full = c("Simplification", "Simplification + Social Norm",
+                       "Simplification + Deterrence", "Simplification + Public Good Appeal")
+  )) +
+  theme_classic() +
+  coord_cartesian(xlim = c(20, 100)) +
+  labs(y = "Predicted Probability of Tax Compliance (95% CI)", title = "", colour = "Gender")
+
+gender_gap <- comparisons(
+  model_HTE_gender_age, variables = "Gender",
+  newdata = datagrid(Age = c(30, 40, 50, 60, 70, 80),
+                     Treatment_full = c("Simplification", "Simplification + Social Norm",
+                                        "Simplification + Deterrence",
+                                        "Simplification + Public Good Appeal"))
+)
+gender_gap$p_holm <- p.adjust(gender_gap$p.value, method = "holm")
+```
+
+```{r}
+## Heterogeneous Treatment Effects by Tax Burden 
+tax_cut <- quantile(data_subset$Tax_total, c(.25, .50, .75), na.rm = TRUE)
+
+data_subset <- data_subset %>%
+  mutate(Tax_quartile = factor(
+    case_when(Tax_total <= tax_cut[1] ~ "Q1",
+              Tax_total <= tax_cut[2] ~ "Q2",
+              Tax_total <= tax_cut[3] ~ "Q3",
+              TRUE                    ~ "Q4"),
+    levels = c("Q1", "Q2", "Q3", "Q4")))
+
+values_quartiles <- data_subset %>%
+  group_by(Tax_quartile) %>%
+  summarise(min_value = min(Tax_total, na.rm = TRUE),
+            max_value = max(Tax_total, na.rm = TRUE))
+
+model_HTE_tax <- lm_robust(Tax_paid_ontime ~ Treatment_full * Tax_quartile + Tax_declaration_21 + Gender + Age, data = data_subset, clusters = Admin_ID, se_type = "CR2")
+
+plot_int_tax <- plot_predictions(
+  model_HTE_tax,
+  condition = c("Treatment_full", "Tax_quartile")
+) +
+  theme_classic() +
+  labs(y = "Predicted Probability of Tax Compliance (95% CI)", title = "", x = "")+ 
+  scale_colour_grey(labels = c("Q1 (3 - 35 EUR)",
+                               "Q2 (36 - 63 EUR)",
+                               "Q3 (64 - 100 EUR)",
+                               "Q4 (>101 EUR)")) +
+  theme(legend.position = "bottom")
+
+hte_tax <- avg_comparisons(model_HTE_tax, variables = "Treatment_full",
+                           by = "Tax_quartile") %>%
+  mutate(Treatment = factor(gsub(" - Control$", "", contrast), levels = treatment_order))
+
+plot_inter_tax <- hte_tax %>%
+  mutate(across(c(estimate, conf.low, conf.high), ~ . * 100)) %>%
+  ggplot(aes(y = Treatment, colour = Tax_quartile)) +
+  geom_errorbar(aes(xmin = conf.low, xmax = conf.high),
+                width = 0, position = position_dodge(width = 0.5)) +
+  geom_point(aes(x = estimate, shape = Tax_quartile),
+             position = position_dodge(width = 0.5), size = 2) +
+  geom_vline(xintercept = 0, colour = "grey", linetype = "dashed") +
+  scale_x_continuous(breaks = round(seq(-1, 4, by = .5), 2)) +
+  coord_cartesian(xlim = c(-1, 4)) +
+  scale_colour_grey("Tax burden (quartile)") +
+  scale_shape_discrete("Tax burden (quartile)") +
+  labs(x = expression(atop("Predicted Treatment Effect (95% CI)",
+       italic("Property Tax Timely Payment (single payment or instalments)"))),
+       y = "") +
+  theme_classic() +
+  theme(axis.text.y = element_text(angle = 30, hjust = 1, size = 8))
+```
+
+```{r}
+## Figure C.1f: Predicted Probability of Tax Compliance across Treatment Groups and Tax Quartile  
+plot_int_tax <- plot_predictions(
+            model_HTE_tax,
+           condition = c("Treatment_full", "Tax_quartile"),
+           legend.title = "Tax Quartile")+
+  theme_classic() + 
+  labs(y = "Predicted Probability of Tax Compliance (95% CI)", title = "", x = "")+ 
+  scale_colour_grey(labels = c("Q1 (3 - 35 EUR)",
+                               "Q2 (36 - 63 EUR)",
+                               "Q3 (64 - 100 EUR)",
+                               "Q4 (>101 EUR)"))+
+  theme(legend.position = "bottom")
+```
+
+```{r}
+## Heterogeneous Treatment Effects by Tax Declaration  
+model_HTE_tax_decl <- lm_robust(Tax_paid_ontime ~ Treatment_full * Tax_declaration_21 + Tax_total + Gender + Age, data = data_subset, clusters = Admin_ID, se_type = "CR2")
+
+hte_tax_decl <- avg_comparisons(model_HTE_tax_decl, variables = "Treatment_full", by = "Tax_declaration_21") %>%
+  mutate(
+    Treatment = factor(gsub(" - Control$", "", contrast), levels = treatment_order),
+    Tax_declaration_2021 = dplyr::recode(Tax_declaration_21,
+      "0" = "not filed in 2021", "1" = "filed in 2021")
+    )
+
+plot_inter_tax_decl <- hte_tax_decl %>% 
+  mutate(estimate = estimate*100, conf.low = conf.low*100, conf.high = conf.high*100) %>%
+  ggplot(aes(y = Treatment, colour = Tax_declaration_2021)) +
+  geom_errorbar(aes(xmin = conf.low, xmax = conf.high),
+                width = 0, position = position_dodge(width = 0.5)) +
+  geom_point(aes(x = estimate, shape = Tax_declaration_2021),
+             position = position_dodge(width = 0.5), size = 2) +
+  geom_vline(xintercept = 0, colour = "grey", linetype = "dashed") +
+  scale_x_continuous(breaks = round(seq(-1.5, 4, by = .5), 2)) +
+  coord_cartesian(xlim = c(-1.5, 4)) +
+  scale_colour_grey("Tax declaration") +
+  scale_shape_discrete("Tax declaration") +
+  theme_classic() +
+  theme(axis.text.y = element_text(angle = 30, hjust = 1, size = 8)) +
+  labs(x = expression(atop("Predicted Treatment Effect (95% CI)",
+                          italic("Property Tax Timely Payment (single payment or instalments)"))),
+       y = "")
+```
+
+```{r}
+## Predicted Probability of Tax Compliance across Treatment Groups and Tax Declaration 
+plot_int_tax_decl <- plot_predictions(
+  model_HTE_tax_decl,
+  condition = c("Treatment_full", "Tax_declaration_21")
+) +
+  theme_classic() +
+  scale_colour_grey("Tax declaration",
+                    breaks = c("0", "1"), labels = c("not filed in 2021", "filed in 2021")) +
+  labs(y = "Predicted Probability of Tax Compliance (95% CI)", title = "", x = "")
+```
+
+```{r}
+### Average Treatment Effects (DV = Tax paid on-time in a single payment)
+# Basic Model
+model1_singlep <- lm_robust(Tax_paid_singlepay ~ Treatment_full, 
+                    data = data_subset, clusters = Admin_ID, se_type = "CR2")
+
+# Model with covariates and age squared
+model2_singlep <- lm_robust(Tax_paid_singlepay ~ Treatment_full + Tax_total + Tax_declaration_21 + Gender + Age + I(Age^2), data = data_subset, clusters = Admin_ID, se_type = "CR2")
+
+# Model with covariates and age linear
+model3_singlep <- lm_robust(Tax_paid_singlepay ~ Treatment_full + Tax_total + Tax_declaration_21 + Gender + Age, data = data_subset, clusters = Admin_ID, se_type = "CR2")
+
+model_summary1_SP <- tidy(model1_singlep, conf.int = TRUE)
+model_summary1_SP$model <- "Model1"
+
+model_summary2_SP <- tidy(model2_singlep, conf.int = TRUE)
+model_summary2_SP$model <- "Model2"
+
+model_summary3_SP <- tidy(model3_singlep, conf.int = TRUE)
+model_summary3_SP$model <- "Model3"
+
+model_all_SP <- rbind(model_summary1_SP, model_summary2_SP, model_summary3_SP) 
+
+model_two_SP <- rbind(model_summary1_SP, model_summary3_SP) 
+
+model_all_SP <- model_all_SP %>%
+  mutate(
+    Treatment = gsub("Treatment_full", "", term)
+  ) %>% 
+  relocate(Treatment, .after = term) 
+
+model_two_SP <- model_two_SP %>%
+  mutate(
+    Treatment = gsub("Treatment_full", "", term)
+  ) %>% 
+  relocate(Treatment, .after = term) 
+
+model_all_SP <- model_all_SP %>% 
+  filter(!grepl("Admin|Age|Gender|Tax", term)) %>% 
+  mutate(Treatment = if_else(Treatment == "(Intercept)", "Control", Treatment)) %>% 
+  select(-term)
+
+model_two_SP <- model_two_SP %>% 
+  filter(!grepl("Admin|Age|Gender|Tax", term)) %>% 
+  mutate(Treatment = if_else(Treatment == "(Intercept)", "Control", Treatment)) %>% 
+  select(-term)
+
+model_all_SP$Treatment <- factor(model_all_SP$Treatment, levels = 
+                                c("Simplification + Public Good Appeal",
+                                   "Simplification + Deterrence", 
+                                   "Simplification + Social Norm", 
+                                  "Simplification", 
+                                  "Control"
+                                  ))
+
+model_two_SP$Treatment <- factor(model_two_SP$Treatment, levels = 
+                                c("Simplification + Public Good Appeal",
+                                   "Simplification + Deterrence", 
+                                   "Simplification + Social Norm", 
+                                  "Simplification", 
+                                  "Control"
+                                  ))
+
+model_all_SP$model <- factor(model_all_SP$model,
+  levels = c("Model1", "Model2", "Model3"),
+  labels = c("No covariates", "Covariates + Age squared", "Covariates + Age linear"))
+
+# Figure with all three models
+figure1_SP <- model_all_SP %>% 
+  filter(!Treatment == "Control") %>% 
+  mutate(estimate = estimate*100,
+         conf.low = conf.low*100,
+         conf.high = conf.high*100) %>% 
+  ggplot(aes(y = Treatment, x = estimate, colour = model)) +
+  geom_errorbar(aes(xmin = conf.low, xmax = conf.high), width=0, position= position_dodge(width=0.5)) +
+   geom_point(aes(x = estimate, shape = model), position = position_dodge(width=0.5), size=2) +
+  scale_x_continuous(limits=c(-1, 3.5), breaks = round(seq(-1, 3.5, by = .5), 2))+
+  geom_vline(xintercept = 0, linetype = "dashed")+
+  labs(x = expression(atop("Predicted Treatment Effect (95% CI)", italic("Property Tax Timely Payment (single payment or instalments)"), 
+      )),  y = "") +
+  theme_classic() +
+  theme(axis.text.y = element_text(angle = 30, hjust = 1, size = 8)) + 
+ scale_shape_discrete(name = "Models") +
+  scale_colour_grey(name = "Models", start = 0.2, end = 0.8, aesthetics = "colour") +
+  theme(legend.position="right")
+```
+
+```{r}
+lh_social_norm_SP <- linearHypothesis(model3_singlep, "Treatment_fullSimplification + Social Norm = Treatment_fullSimplification")
+Chisq_social_norm_SP <- round(lh_social_norm_SP$Chisq[2], 4)
+Df_social_norm_SP <- lh_social_norm_SP$Res.Df[2]
+P_social_norm_SP <- round(lh_social_norm_SP$`Pr(>Chisq)`[2], 4)
+
+lh_deterrence_SP <- linearHypothesis(model3_singlep, "Treatment_fullSimplification + Deterrence = Treatment_fullSimplification")
+Chisq_deterrence_SP <- round(lh_deterrence_SP$Chisq[2], 4)
+Df_deterrence_SP <- lh_deterrence_SP$Res.Df[2]
+P_deterrence_SP <- round(lh_deterrence_SP$`Pr(>Chisq)`[2], 4)
+
+lh_public_SP <- linearHypothesis(model3_singlep, "Treatment_fullSimplification + Public Good Appeal = Treatment_fullSimplification")
+Chisq_public_SP <- round(lh_public_SP$Chisq[2], 4)
+Df_public_SP <- lh_public_SP$Res.Df[2]
+P_public_SP <- round(lh_public_SP$`Pr(>Chisq)`[2], 4)
+
+# Create a data frame with the results
+lh_results_SP <- data.frame(
+  Treatment = c(
+    "Simplification + Social Norm",
+    "Simplification + Deterrence",
+    "Simplification + Public Good Appeal"
+  ),
+  Chisq = c(Chisq_social_norm_SP, Chisq_deterrence_SP, Chisq_public_SP),
+  Df = c(Df_social_norm_SP, Df_deterrence_SP, Df_public_SP),
+  p_value = c(P_social_norm_SP, P_deterrence_SP, P_public_SP)
+)
+
+```
+
+```{r}
+## Predicted Probability of Tax Compliance across the Control and Treatment Groups (95% CI)
+pred_model_1_SE <- avg_predictions(model1_singlep, by = "Treatment_full")
+pred_model_2_SE <- avg_predictions(model2_singlep, by = "Treatment_full")
+pred_model_3_SE <- avg_predictions(model3_singlep, by = "Treatment_full")
+
+pred_model_1_SE$model <- "Model 1: no covariates"
+pred_model_2_SE$model <- "Model 2: covariates + Age + Age^2"
+pred_model_3_SE$model <- "Model 3: covariates + Age"
+
+preds_two_SE <- bind_rows(as.data.frame(pred_model_1_SE),
+                       as.data.frame(pred_model_3_SE))
+
+preds_two_SE$Treatment_full <- factor(preds_two_SE$Treatment_full,
+  levels = c("Control", "Simplification", "Simplification + Social Norm",
+             "Simplification + Deterrence", "Simplification + Public Good Appeal"))
+
+plot_pred_prob <- ggplot(preds_two_SE, aes(Treatment_full, estimate, colour = model)) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high),
+                width = 0, position = position_dodge(width = 0.5)) +
+  geom_point(aes(shape = model), position = position_dodge(width = 0.5), size = 2) +
+  coord_cartesian(ylim = c(.92, .95)) +    
+  ylab("Predicted Probability of Tax Compliance (95% CI)") +
+  xlab("") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1, size = 8)) +
+  scale_shape_discrete(name = "Models",
+                       labels = c("No covariates", "Covariates")) +
+  scale_colour_grey(name = "Models",
+                    labels = c("No covariates", "Covariates"),
+                    start = 0.2, end = 0.8) +
+  theme(legend.position = "right")
+```
+
+```{r}
+## Heterogeneous Treatment Effects by Gender  
+model_HTE_gender_SP <- lm_robust(Tax_paid_singlepay ~ Treatment_full * Gender + Tax_total + Tax_declaration_21 + Age, data = data_subset, clusters = Admin_ID, se_type = "CR2")
+
+hte_gender_SP <- avg_comparisons(
+  model_HTE_gender_SP,
+  variables = "Treatment_full",
+  by        = "Gender"
+) %>%
+  mutate(
+    Treatment = gsub(" - Control$", "", contrast),
+    Gender    = case_when(Gender == "F" ~ "Female",
+                          Gender == "M" ~ "Male",
+                          TRUE ~ as.character(Gender))
+  )
+
+treatment_order <- c("Simplification + Public Good Appeal",
+                     "Simplification + Deterrence",
+                     "Simplification + Social Norm",
+                     "Simplification")
+
+plot_inter_gender_SP <- hte_gender_SP %>%
+  mutate(estimate  = estimate  * 100,
+         conf.low  = conf.low  * 100,
+         conf.high = conf.high * 100,
+         Treatment = factor(Treatment, levels = treatment_order)) %>%
+  ggplot(aes(y = Treatment, colour = Gender)) +
+  geom_errorbar(aes(xmin = conf.low, xmax = conf.high),
+                width = 0, position = position_dodge(width = 0.5)) +
+  geom_point(aes(x = estimate, shape = Gender),
+             position = position_dodge(width = 0.5), size = 2) +
+  geom_vline(xintercept = 0, colour = "grey", linetype = "dashed") +
+  scale_x_continuous(breaks = round(seq(-1, 3, by = .5), 2)) +
+  coord_cartesian(xlim = c(-1, 3)) +
+  scale_colour_grey("Gender") +
+  scale_shape_discrete("Gender") +
+  theme_classic() +
+  theme(axis.text.y = element_text(angle = 30, hjust = 1, size = 8),
+        plot.title  = element_text(hjust = 0.5, face = "bold")) +
+  labs(
+    x = expression(atop("Predicted Treatment Effect (95% CI)",
+                        italic("Property Tax Payment (single payment only)"))),
+    y = ""
+  )
+```
+
+```{r}
+## Predicted Probability of Tax Compliance across Treatment Groups and Gender
+plot_int_gender_SP <- plot_model(model_HTE_gender_SP, 
+           type = "pred",
+           terms = c("Treatment_full[all]", "Gender[all]"),
+           #colors = "bw",
+           legend.title = "Gender")+
+  theme_classic() + 
+  labs(y = "Predicted Probability of Tax Compliance (95% CI)", title = "", x = "")+ 
+  scale_colour_grey(labels = c("Male", "Female"))
+```
+
+```{r}
+## Heterogeneous Treatment Effects by Age 
+model_HTE_age_SE <- lm_robust(Tax_paid_singlepay ~ Treatment_full * Age + Treatment_full * I(Age^2) + Tax_total + Tax_declaration_21 + Gender, data = data_subset, clusters = Admin_ID, se_type = "CR2")
+
+hte_age_SE <- comparisons(
+  model_HTE_age_SE,
+  variables = "Treatment_full",
+  newdata   = datagrid(Age = age_seq)
+) %>%
+  mutate(
+    Treatment = gsub(" - Control$", "", contrast),
+    Treatment = factor(Treatment, levels = c(
+      "Simplification", "Simplification + Social Norm",
+      "Simplification + Deterrence", "Simplification + Public Good Appeal"))
+  )
+
+## Plot: conf.low // conf.high directly, percentage points
+plot_inter_age_cont_SE <- hte_age_SE %>%
+  mutate(estimate  = estimate  * 100,
+         conf.low  = conf.low  * 100,
+         conf.high = conf.high * 100) %>%
+  ggplot(aes(x = Age, y = estimate)) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2, fill = "dimgrey") +
+  geom_line(linewidth = .8, colour = "dimgrey") +
+  geom_hline(yintercept = 0, colour = "darkgrey", linetype = "dashed") +
+  facet_wrap(~ Treatment) +
+  coord_cartesian(xlim = c(20, 100)) +
+  theme_classic() +
+  labs(x = "Age",
+       y = expression(atop("Predicted Treatment Effect (95% CI)",
+                          italic("Property Tax Timely Payment (single payment only)")))) +
+  theme(legend.position = "none")
+```
+
+```{r}
+## Predicted Probability of Tax Compliance across Treatment Groups and Age
+plot1_age_SE <- plot_model(model_HTE_age_SE, 
+           type = "pred",
+           terms = c("Age[all]", "Treatment_full[Control, Simplification]"),
+           colors = "bw",
+           legend.title = "Treatment type")+
+  theme_classic() + 
+  labs(y = "Predicted Probability of Tax Compliance (95% CI) - Single Payment", title = "")+
+  theme(legend.position = "bottom")
+
+plot2_age_SE <- plot_model(model_HTE_age_SE, 
+           type = "pred",
+           terms = c("Age[all]", "Treatment_full[Control, Simplification + Social Norm]"),
+           colors = "bw",
+           legend.title = "Treatment type")+
+  theme_classic() + 
+  labs(y = "Predicted Probability of Tax Compliance (95% CI) - Single Payment", title = "")+
+  theme(legend.position = "bottom")
+
+plot3_age_SE <- plot_model(model_HTE_age_SE, 
+           type = "pred",
+           terms = c("Age[all]", "Treatment_full[Control, Simplification + Deterrence]"),
+           colors = "bw",
+           legend.title = "Treatment type")+
+  theme_classic() + 
+  labs(y = "Predicted Probability of Tax Compliance (95% CI) - Single Payment", title = "")+
+  theme(legend.position = "bottom")
+
+plot4_age_SE <- plot_model(model_HTE_age_SE, 
+           type = "pred",
+           terms = c("Age[all]", "Treatment_full[Control, Simplification + Public Good Appeal]"),
+           colors = "bw",
+           legend.title = "Treatment type")+
+  theme_classic() + 
+  labs(y = "Predicted Probability of Tax Compliance (95% CI) - Single Payment", title = "")+
+  theme(legend.position = "bottom")
+
+grid.arrange(plot1_age_full, plot2_age_full, plot3_age_full, plot4_age_full)
+```
+
+```{r}
+## Predicted Tax Compliance by Treatment, Age and Gender  
+model_HTE_gender_age_SE <- lm_robust(Tax_paid_singlepay ~ Treatment_full * Gender * Age + Treatment_full * Gender * I(Age^2) + Tax_total + Tax_declaration_21, data = data_subset, clusters = Admin_ID, se_type = "CR2")
+
+plot_gender_age_SE <- plot_predictions(
+  model_HTE_gender_age_SE,
+  condition = list(
+    Age            = 20:100,
+    Gender        = unique,
+    Treatment_full = c("Simplification", "Simplification + Social Norm",
+                       "Simplification + Deterrence", "Simplification + Public Good Appeal")
+  )) +
+  theme_classic() +
+  coord_cartesian(xlim = c(20, 100)) +
+  labs(y = "Predicted Probability of Tax Compliance (95% CI)", title = "", colour = "Gender")
+
+gender_age_gap_SE <- comparisons(
+  model_HTE_gender_age_SE,
+  variables = "Gender",                                   
+  newdata   = datagrid(Age = c(30, 40, 50, 60, 70, 80),
+                       Treatment_full = c("Simplification",
+                                          "Simplification + Social Norm",
+                                          "Simplification + Deterrence",
+                                          "Simplification + Public Good Appeal"))
+)
+```
+
+#### Heterogeneous Treatment Effects - Overall Tax Burden
+
+```{r}
+## Heterogeneous Treatment Effects by Tax Burden Single Payment
+# use tax_cut object
+# use values_quartiles object
+# use Tax_quartile variable
+# use treatment_order
+
+model_HTE_tax_SE <- lm_robust(Tax_paid_singlepay ~ Treatment_full * Tax_quartile + Tax_declaration_21 + Gender + Age, data = data_subset, clusters = Admin_ID, se_type = "CR2")
+
+hte_tax_SE <- avg_comparisons(
+  model_HTE_tax_SE, variables = "Treatment_full", by = "Tax_quartile"
+) %>%
+  mutate(
+    Treatment = factor(gsub(" - Control$", "", contrast), levels = treatment_order))
+
+plot_inter_tax_SE <- hte_tax_SE %>%
+  mutate(estimate = estimate*100, conf.low = conf.low*100, conf.high = conf.high*100) %>%
+  ggplot(aes(y = Treatment, colour = Tax_quartile)) +
+  geom_errorbar(aes(xmin = conf.low, xmax = conf.high),
+                width = 0, position = position_dodge(width = 0.5)) +
+  geom_point(aes(x = estimate, shape = Tax_quartile),
+             position = position_dodge(width = 0.5), size = 2) +
+  geom_vline(xintercept = 0, colour = "grey", linetype = "dashed") +
+  scale_x_continuous(breaks = round(seq(-1, 4, by = .5), 2)) +
+  coord_cartesian(xlim = c(-1, 4)) +
+  scale_colour_grey("Tax burden (quartile)") +
+  scale_shape_discrete("Tax burden (quartile)") +
+  theme_classic() +
+  theme(axis.text.y = element_text(angle = 30, hjust = 1, size = 8)) +
+  labs(x = expression(atop("Predicted Treatment Effect (95% CI)",
+                          italic("Property Tax Timely Payment (single payment only)"))),
+       y = "")
+```
+
+```{r}
+## Predicted Probability of Tax Compliance across Treatment Groups and Tax Quartiles 
+plot_int_tax_SE <- plot_predictions(
+  model_HTE_tax_SE,
+  condition = c("Treatment_full", "Tax_quartile")
+) +
+  theme_classic() +
+  labs(y = "Predicted Probability of Tax Compliance (95% CI) - Single Payment", title = "", x = "")+ 
+  scale_colour_grey(labels = c("Q1 (3 - 35 EUR)",
+                               "Q2 (35 - 63 EUR)",
+                               "Q3 (63 - 100 EUR)",
+                               "Q4 (>101 EUR)")) +
+  theme(legend.position = "bottom")
+```
+
+
+```{r}
+#### Heterogeneous Treatment Effects - Tax Declaration 
+model_HTE_tax_decl_SE <- lm_robust(Tax_paid_singlepay ~ Treatment_full * Tax_declaration_21 + Tax_total + Gender + Age, data = data_subset, clusters = Admin_ID, se_type = "CR2")
+
+hte_tax_decl_SE <- avg_comparisons(model_HTE_tax_decl_SE, variables = "Treatment_full", by = "Tax_declaration_21") %>%
+  mutate(
+    Treatment = factor(gsub(" - Control$", "", contrast), levels = treatment_order),
+    Tax_declaration_2021 = dplyr::recode(Tax_declaration_21,
+      "0" = "not filed in 2021", "1" = "filed in 2021")
+    )
+
+plot_inter_tax_decl_SE <- hte_tax_decl_SE %>% 
+  mutate(estimate = estimate*100, conf.low = conf.low*100, conf.high = conf.high*100) %>%
+  ggplot(aes(y = Treatment, colour = Tax_declaration_2021)) +
+  geom_errorbar(aes(xmin = conf.low, xmax = conf.high),
+                width = 0, position = position_dodge(width = 0.5)) +
+  geom_point(aes(x = estimate, shape = Tax_declaration_2021),
+             position = position_dodge(width = 0.5), size = 2) +
+  geom_vline(xintercept = 0, colour = "grey", linetype = "dashed") +
+  scale_x_continuous(breaks = round(seq(-1.5, 4, by = .5), 2)) +
+  coord_cartesian(xlim = c(-2.5, 4)) +
+  scale_colour_grey("Tax declaration") +
+  scale_shape_discrete("Tax declaration") +
+  theme_classic() +
+  theme(axis.text.y = element_text(angle = 30, hjust = 1, size = 8)) +
+  labs(x = expression(atop("Predicted Treatment Effect (95% CI)",
+                          italic("Property Tax Timely Payment (single payment only)"))),
+       y = "")
+```
+
+```{r}
+## Predicted Probability of Tax Compliance across Treatment Groups and Tax Declaration  
+plot_int_tax_decl_SE <- plot_predictions(
+  model_HTE_tax_decl_SE,
+  condition = c("Treatment_full", "Tax_declaration_21")
+) +
+  theme_classic() +
+  scale_colour_grey("Tax declaration",
+                    breaks = c("0", "1"), labels = c("not filed in 2021", "filed in 2021")) +
+  labs(y = "Predicted Probability of Tax Compliance (95% CI) - Single Payment", title = "", x = "")
+```
+
+```{r}
+## Table C.3b: Full Regression Table for Figure C.2a
+modelsummary(models = list("Model 1" = model1_full, "Model 2" = model2_full),
+                           statistic = "std.error",
+                           stars = c('***' = .001, '**' = .01, '*' = .05),
+                           coef_omit = c(10), 
+                           coef_rename = c("Control", 
+                                        "Simplification", 
+                                        "Simplification + Social Norm", 
+                                        "Simplification + Deterrence", 
+                                        "Simplification + Public Good Appeal",
+                                        "Tax total", 
+                                        "Tax declaration 2021",
+                                        "Female", 
+                                        "Age"),
+                           output = "kableExtra") %>% 
+    kable_styling(full_width = FALSE, font_size = 10, latex_options = "HOLD_position")
+```
+
+### Figure C.4a:** Treatment Effects Relative to the Control Group (Different Heteroskedasticity-Consistent Covariance Matrix estimators)
+```{r}
+## Figure C.4a:** Treatment Effects Relative to the Control Group (Different Heteroskedasticity-Consistent Covariance Matrix estimators)
+
+# Model with covariates and standard SE (Non-robust)
+model_classic <- lm_robust(Tax_paid_ontime_full_or_part ~ Treatment_full + Tax_total + Tax_declaration_21 + Gender + Age + I(Age^2), data = data_subset_filtered, se_type = "classical")
+
+# Model with covariates and robust SE (HC0)
+model_HC0 <- lm_robust(Tax_paid_ontime_full_or_part ~ Treatment_full + Tax_total + Tax_declaration_21 + Gender + Age + I(Age^2), data = data_subset_filtered, se_type = "HC0")
+
+# Model with covariates and robust SE (HC1 - Stata)
+model_HC1 <- lm_robust(Tax_paid_ontime_full_or_part ~ Treatment_full + Tax_total + Tax_declaration_21 + Gender + Age + I(Age^2), data = data_subset_filtered, se_type = "HC1")
+
+# Model with covariates and robust SE (HC2)
+model_HC2 <- lm_robust(Tax_paid_ontime_full_or_part ~ Treatment_full + Tax_total + Tax_declaration_21 + Gender + Age + I(Age^2), data = data_subset_filtered, se_type = "HC2")
+
+# Model with covariates and robust SE (HC3)
+model_HC3 <- lm_robust(Tax_paid_ontime_full_or_part ~ Treatment_full + Tax_total + Tax_declaration_21 + Gender + Age + I(Age^2), data = data_subset_filtered, se_type = "HC3")
+
+model_summary_classic <- tidy(model_classic, conf.int = TRUE)
+model_summary_classic$model <- "Classic"
+
+model_summary_HC0 <- tidy(model_HC0, conf.int = TRUE)
+model_summary_HC0$model <- "HC0"
+
+model_summary_HC1 <- tidy(model_HC1, conf.int = TRUE)
+model_summary_HC1$model <- "HC1"
+
+model_summary_HC2 <- tidy(model_HC2, conf.int = TRUE)
+model_summary_HC2$model <- "HC2"
+
+model_summary_HC3 <- tidy(model_HC3, conf.int = TRUE)
+model_summary_HC3$model <- "HC3"
+
+
+model_all_full <- rbind(model_summary_classic, model_summary_HC0, model_summary_HC1, model_summary_HC2, model_summary_HC3) 
+
+model_all_full <- model_all_full %>%
+  mutate(
+    Treatment = gsub("Treatment_full", "", term)
+  ) %>% 
+  relocate(Treatment, .after = term) 
+
+model_all_full <- model_all_full %>% 
+  filter(!grepl("Age|Gender|Tax", term)) %>% 
+  mutate(Treatment = if_else(Treatment == "(Intercept)", "Control", Treatment)) %>% 
+  select(-term)
+
+model_all_full$Treatment <- factor(model_all_full$Treatment, levels = 
+                                c("Simplification + Public Good Appeal",
+                                   "Simplification + Deterrence", 
+                                   "Simplification + Social Norm", 
+                                  "Simplification", 
+                                  "Control"
+                                  ))
+
+plot_SE_robust <- model_all_full %>% 
+  filter(!Treatment == "Control") %>% 
+  mutate(estimate = estimate*100,
+         conf.low = conf.low*100,
+         conf.high = conf.high*100) %>% 
+  ggplot(aes(y = Treatment, x = estimate, colour = model)) +
+  geom_errorbar(aes(xmin = conf.low, xmax = conf.high), width=0, position= position_dodge(width=0.5)) +
+   geom_point(aes(x = estimate, shape = model), position = position_dodge(width=0.5), size=2) +
+  scale_x_continuous(limits=c(-1, 4), breaks = round(seq(-1, 4, by = .5), 2))+
+  geom_vline(xintercept = 0, linetype = "dashed")+
+  labs(x = "Predicted Treatment Effect (95% CI)", y = "") +
+  theme_classic() +
+  theme(axis.text.y = element_text(angle = 30, hjust = 1, size = 8)) + 
+ scale_shape_discrete(name = "Models", labels = c("Non-robust SE", "HC0 estimator", "HC1 - Stata estimator", "HC2 estimator", "HC3 estimator")) +
+  scale_colour_grey(name = "Models", labels = c("Non-robust SE", "HC0 estimator", "HC1 - Stata estimator", "HC2 estimator", "HC3 estimator"), start = 0.2, end = 0.8, aesthetics = "colour") +
+  theme(legend.position="right") 
+```
+
+```{r Outlier removal sensitity analysis any payment}
+# using data_subset_tax
+
+# Basic Model with robust SE
+model1b <- lm_robust(Tax_paid_ontime ~ Treatment_full, 
+                    data = data_subset_tax, clusters = Admin_ID, se_type = "CR2")
+
+# Age linear
+model2b <- lm_robust(Tax_paid_ontime ~ Treatment_full + Tax_total + Tax_declaration_21 + Gender + Age, data = data_subset_tax, clusters = Admin_ID, se_type = "CR2")
+
+model_summary1b <- tidy(model1b, conf.int = TRUE)
+model_summary1b$model <- "Model1"
+
+model_summary2b <- tidy(model2b, conf.int = TRUE)
+model_summary2b$model <- "Model2"
+
+model_two_b <- rbind(model_summary1b, model_summary2b) 
+
+model_two_b <- model_two_b %>%
+  mutate(
+    Treatment = gsub("Treatment_full", "", term)
+  ) %>% 
+  relocate(Treatment, .after = term) 
+
+model_two_b <- model_two_b %>% 
+  filter(!grepl("Admin|Age|Gender|Tax", term)) %>% 
+  mutate(Treatment = if_else(Treatment == "(Intercept)", "Control", Treatment)) %>% 
+  select(-term)
+
+model_two_b$Treatment <- factor(model_two_b$Treatment, levels = 
+                                c("Simplification + Public Good Appeal",
+                                   "Simplification + Deterrence", 
+                                   "Simplification + Social Norm", 
+                                  "Simplification", 
+                                  "Control"
+                                  ))
+
+# regression table
+# use cm object
+# Reported in the Appendix with three models (with age squared, with age numeric variable, and without age)
+
+modelsummary(
+  list("Simple model" = model1b, "Model with Age linear" = model2b),
+  statistic = "std.error",
+  stars     = c('***' = .001, '**' = .01, '*' = .05),
+  coef_map  = cm,
+  gof_map   = c("nobs", "r.squared", "adj.r.squared"),
+  notes     = "Cluster-robust (CR2) standard errors, clustered at the administrator level (31 clusters), in parentheses.",
+  output    = "kableExtra"
+) %>%
+  kable_styling(full_width = FALSE, font_size = 10, latex_options = "HOLD_position")
+```
+
+```{r fig.width=10, fig.height=8}
+print(figure1b)
+```
+
+```{r Outlier removal sensitivty analysis single payment}
+# Basic Model with robust SE
+model1b_SP <- lm_robust(Tax_paid_singlepay ~ Treatment_full, 
+                    data = data_subset_tax, clusters = Admin_ID, se_type = "CR2")
+
+# Age linear
+model2b_SP <- lm_robust(Tax_paid_singlepay ~ Treatment_full + Tax_total + Tax_declaration_21 + Gender + Age, data = data_subset_tax, clusters = Admin_ID, se_type = "CR2")
+
+model_summary1b_SP <- tidy(model1b_SP, conf.int = TRUE)
+model_summary1b_SP$model <- "Model1"
+
+model_summary2b_SP <- tidy(model2b_SP, conf.int = TRUE)
+model_summary2b_SP$model <- "Model2"
+
+model_two_b_SP <- rbind(model_summary1b_SP, model_summary2b_SP) 
+
+model_two_b_SP <- model_two_b_SP %>%
+  mutate(
+    Treatment = gsub("Treatment_full", "", term)
+  ) %>% 
+  relocate(Treatment, .after = term) 
+
+model_two_b_SP <- model_two_b_SP %>% 
+  filter(!grepl("Admin|Age|Gender|Tax", term)) %>% 
+  mutate(Treatment = if_else(Treatment == "(Intercept)", "Control", Treatment)) %>% 
+  select(-term)
+
+model_two_b_SP$Treatment <- factor(model_two_b_SP$Treatment, levels = 
+                                c("Simplification + Public Good Appeal",
+                                   "Simplification + Deterrence", 
+                                   "Simplification + Social Norm", 
+                                  "Simplification", 
+                                  "Control"
+                                  ))
+
+# regression table
+# use cm object
+# Reported in the Appendix with three models (with age squared, with age numeric variable, and without age)
+
+modelsummary(
+  list("Simple model" = model1b_SP, "Model with Age linear" = model2b_SP),
+  statistic = "std.error",
+  stars     = c('***' = .001, '**' = .01, '*' = .05),
+  coef_map  = cm,
+  gof_map   = c("nobs", "r.squared", "adj.r.squared"),
+  notes     = "Cluster-robust (CR2) standard errors, clustered at the administrator level (31 clusters), in parentheses.",
+  output    = "kableExtra"
+) %>%
+  kable_styling(full_width = FALSE, font_size = 10, latex_options = "HOLD_position")
+```
+
+```{r}
+saveRDS(list(model1 = model1,
+             model2 = model2,
+             model3 = model3,
+             model1_hc3 = model1_hc3,
+             model2_hc3 = model2_hc3,
+             model3_hc3 = model3_hc3,
+             model_HTE_gender   = model_HTE_gender,
+             model_HTE_age      = model_HTE_age,
+             model_HTE_age_linear = model_HTE_age_linear,
+             model_HTE_gender_age = model_HTE_gender_age,
+             model_HTE_tax      = model_HTE_tax,
+             model_HTE_tax_decl = model_HTE_tax_decl,
+             model1_singlep = model1_singlep,
+             model2_singlep = model2_singlep,
+             model3_singlep = model2_singlep,
+             model_HTE_gender_SP = model_HTE_gender_SP,
+             model_HTE_age_SP = model_HTE_age_SP,
+             model_HTE_age_linear_SP = model_HTE_age_linear_SP,
+             model_HTE_gender_age_SP = model_HTE_gender_age_SP,
+             model_HTE_tax_SP      = model_HTE_tax_SP,
+             model_HTE_tax_decl_SP = model_HTE_tax_decl_SP
+             ),
+        "fitted_models.rds")
+```
